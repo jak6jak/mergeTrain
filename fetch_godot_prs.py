@@ -34,7 +34,7 @@ import duckdb
 from tqdm import tqdm
 
 REPO = "godotengine/godot"
-DB_PATH = "godot_prs.duckdb"
+DB_PATH = "md:godot_prs"
 RATE_LIMIT_TARGET = 4500   # requests/hour (leaves 500 buffer from 5000 max)
 DEFAULT_WORKERS = 8
 BATCH_SIZE = 500
@@ -950,7 +950,7 @@ def main():
     parser.add_argument("--fresh",          action="store_true", help="Drop all tables and start over")
     parser.add_argument("--workers",        type=int, default=DEFAULT_WORKERS, help="Concurrent workers for per-PR phases")
     parser.add_argument("--full-list",      action="store_true", help="Force full list re-fetch (non-incremental)")
-    parser.add_argument("--db",             default=DB_PATH, help=f"DuckDB file path (default: {DB_PATH})")
+    parser.add_argument("--db",             default=DB_PATH, help=f"DuckDB path or MotherDuck URI (default: {DB_PATH})")
     parser.add_argument("--backfill-merged",action="store_true",
                         help="Backfill additions/deletions + file breakdown for merged PRs")
     parser.add_argument("--backfill-years", type=int, default=2,
