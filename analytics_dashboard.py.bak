@@ -1,14 +1,9 @@
 import argparse
-import io
 import os
-import sys
 from datetime import date
-from typing import Any
-
-if isinstance(sys.stdout, io.TextIOWrapper):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import duckdb
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -16,12 +11,12 @@ from plotly.subplots import make_subplots
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Generate Godot PR analytics dashboard and social images")
-_ = parser.add_argument("--db", default="md:godot_prs",
-                        help="DuckDB file path or MotherDuck URI (default: md:godot_prs)")
-_ = parser.add_argument("--output-dir", default="social",
-                        help="Output directory for social media PNGs (default: social/)")
-_ = parser.add_argument("--no-html",   action="store_true", help="Skip HTML dashboard output")
-_ = parser.add_argument("--no-images", action="store_true", help="Skip PNG image export")
+parser.add_argument("--db", default="md:godot_prs",
+                    help="DuckDB file path or MotherDuck URI (default: md:godot_prs)")
+parser.add_argument("--output-dir", default="social",
+                    help="Output directory for social media PNGs (default: social/)")
+parser.add_argument("--no-html",   action="store_true", help="Skip HTML dashboard output")
+parser.add_argument("--no-images", action="store_true", help="Skip PNG image export")
 args = parser.parse_args()
 
 con = duckdb.connect(args.db)
@@ -43,7 +38,7 @@ MUTED  = "#8b949e"
 
 FONT = dict(family="'Inter','Segoe UI',system-ui,sans-serif", color=TEXT, size=13)
 
-def base_layout(t: int = 70, **kw: Any) -> dict[str, Any]:
+def base_layout(t=70, **kw):
     return dict(
         paper_bgcolor=CARD,
         plot_bgcolor=CARD,
@@ -61,7 +56,6 @@ counts = con.execute("""
         SUM(CASE WHEN state = 'open'        THEN 1 ELSE 0 END)               AS open_prs
     FROM pull_requests
 """).fetchone()
-assert counts is not None
 TOTAL_PRS, MERGED, OPEN_PRS = counts
 
 ttm_stats = con.execute("""
@@ -73,13 +67,10 @@ ttm_stats = con.execute("""
         SUM(CASE WHEN DATEDIFF('day', created_at, merged_at) > 365 THEN 1 ELSE 0 END) AS year_wait
     FROM pull_requests WHERE merged_at IS NOT NULL
 """).fetchone()
-assert ttm_stats is not None
 MEDIAN_TTM, MEAN_TTM, WEEK_MERGES, LONG_TAIL, YEAR_WAIT = ttm_stats
 
-_fc = con.execute("SELECT COUNT(*) FROM pr_files").fetchone()
-FILE_CHANGES: int = _fc[0] if _fc else 0
-_yr = con.execute("SELECT YEAR(MIN(created_at)) FROM pull_requests").fetchone()
-FIRST_PR_YEAR: int = _yr[0] if _yr else date.today().year
+FILE_CHANGES = con.execute("SELECT COUNT(*) FROM pr_files").fetchone()[0]
+FIRST_PR_YEAR = con.execute("SELECT YEAR(MIN(created_at)) FROM pull_requests").fetchone()[0]
 
 MERGE_RATE = f"{100 * MERGED / TOTAL_PRS:.1f}%"
 WEEK_PCT   = f"{100 * WEEK_MERGES / MERGED:.1f}%"
@@ -108,10 +99,10 @@ fig1.add_trace(go.Scatter(
     marker=dict(size=5), hovertemplate="%{y:.1f}% merge rate<extra></extra>",
 ))
 fig1.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="PR Submissions & Outcomes by Year", font=dict(size=16, color=TEXT), x=0),
     barmode="stack",
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
+    legend=dict(orientation="h", x=0, y=1.13, bgcolor="rgba(0,0,0,0)"),
     xaxis=dict(dtick=1, gridcolor=BORDER),
     yaxis=dict(gridcolor=BORDER, title="Pull Requests"),
     yaxis2=dict(overlaying="y", side="right", range=[0, 110], ticksuffix="%",
@@ -169,13 +160,12 @@ fig2.update_layout(margin=dict(l=20, r=80, t=50, b=20))
 assoc = con.execute("""
     SELECT author_association,
            COUNT(*) total,
-           SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged,
-           SUM(CASE WHEN state = 'open'        THEN 1 ELSE 0 END) still_open
+           SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged
     FROM pull_requests GROUP BY author_association ORDER BY total DESC
 """).df()
-assoc["closed_unmerged"] = assoc["total"] - assoc["merged"] - assoc["still_open"]
-assoc["merge_rate"]      = 100 * assoc["merged"] / assoc["total"]
-assoc["label"] = assoc["author_association"].replace({
+assoc["merge_rate"]  = 100 * assoc["merged"] / assoc["total"]
+assoc["not_merged"]  = assoc["total"] - assoc["merged"]
+assoc["label"] = assoc["author_association"].map({
     "CONTRIBUTOR": "Contributors", "MEMBER": "Core Members",
     "NONE": "First-timers", "COLLABORATOR": "Collaborators",
 })
@@ -183,31 +173,21 @@ assoc["label"] = assoc["author_association"].replace({
 fig3 = make_subplots(rows=1, cols=2,
     subplot_titles=["Volume by Contributor Type", "Merge Rate by Type"],
     column_widths=[0.55, 0.45])
-fig3.add_trace(go.Bar(x=assoc["label"], y=assoc["merged"],
-    name="Merged", marker_color=GREEN,
-    hovertemplate="<b>%{x}</b><br>%{y:,} merged<extra></extra>",
-), row=1, col=1)
-fig3.add_trace(go.Bar(x=assoc["label"], y=assoc["closed_unmerged"],
-    name="Closed (unmerged)", marker_color=RED,
-    hovertemplate="<b>%{x}</b><br>%{y:,} closed without merging<extra></extra>",
-), row=1, col=1)
-fig3.add_trace(go.Bar(x=assoc["label"], y=assoc["still_open"],
-    name="Still Open", marker_color=YELLOW,
-    hovertemplate="<b>%{x}</b><br>%{y:,} still open<extra></extra>",
-), row=1, col=1)
+fig3.add_trace(go.Bar(x=assoc["label"], y=assoc["merged"],     name="Merged",     marker_color=GREEN), row=1, col=1)
+fig3.add_trace(go.Bar(x=assoc["label"], y=assoc["not_merged"], name="Not Merged", marker_color=RED),   row=1, col=1)
 fig3.add_trace(go.Bar(
     x=assoc["label"], y=assoc["merge_rate"],
     name="Merge %", showlegend=False,
     marker_color=[GREEN, BLUE, ORANGE, PURPLE],
     text=[f"{r:.1f}%" for r in assoc["merge_rate"]],
     textposition="outside",
-    hovertemplate="<b>%{x}</b><br>%{y:.1f}% of all submitted PRs merged<extra></extra>",
+    hovertemplate="<b>%{x}</b><br>%{y:.1f}% merge rate<extra></extra>",
 ), row=1, col=2)
 fig3.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="The Contributor Funnel", font=dict(size=16, color=TEXT), x=0),
     barmode="stack",
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
+    legend=dict(orientation="h", x=0, y=1.15, bgcolor="rgba(0,0,0,0)"),
     yaxis=dict(gridcolor=BORDER),
     yaxis2=dict(gridcolor=BORDER, range=[0, 112], ticksuffix="%"),
     xaxis=dict(gridcolor="rgba(0,0,0,0)"),
@@ -252,10 +232,10 @@ fig4.add_trace(go.Pie(
     hovertemplate="<b>%{label}</b><br>%{value:,} (%{percent})<extra></extra>",
 ), row=1, col=2)
 fig4.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="The Review Economy", font=dict(size=16, color=TEXT), x=0),
     barmode="overlay",
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
+    legend=dict(orientation="h", x=0, y=1.15, bgcolor="rgba(0,0,0,0)"),
     xaxis=dict(gridcolor=BORDER),
     yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
 ))
@@ -300,7 +280,7 @@ lbl = con.execute("""
     FROM pr_labels GROUP BY label_name ORDER BY cnt DESC LIMIT 35
 """).df()
 
-def label_cat(name: str) -> str:
+def label_cat(name):
     if name.startswith("topic:"):      return "Topic"
     if name.startswith("platform:"):   return "Platform"
     if name.startswith("cherrypick:"): return "Cherry-pick"
@@ -332,7 +312,7 @@ backlog = con.execute("""
     GROUP BY yr ORDER BY yr
 """).df()
 
-oldest_yr: int = int(backlog["yr"].min()) if not backlog.empty else FIRST_PR_YEAR  # pyright: ignore[reportArgumentType]
+oldest_yr = int(backlog["yr"].min()) if not backlog.empty else FIRST_PR_YEAR
 
 fig7 = go.Figure(go.Bar(
     x=backlog["yr"], y=backlog["open_count"],
@@ -346,7 +326,7 @@ fig7 = go.Figure(go.Bar(
 ))
 annotations = []
 if not backlog.empty:
-    oldest_count = int(backlog[backlog["yr"] == oldest_yr]["open_count"].iloc[0])  # pyright: ignore[reportAttributeAccessIssue]
+    oldest_count = int(backlog[backlog["yr"] == oldest_yr]["open_count"].values[0])
     annotations = [dict(
         x=oldest_yr,
         y=oldest_count + 3,
@@ -434,7 +414,7 @@ fig9.add_trace(go.Bar(
     showlegend=False,
 ), row=1, col=2)
 fig9.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="PR Size vs Merge Rate — Keep It Small", font=dict(size=16, color=TEXT), x=0),
     yaxis=dict(gridcolor=BORDER, title="PRs"),
     yaxis2=dict(gridcolor=BORDER, range=[0, 105], ticksuffix="%", title="Merge Rate"),
@@ -470,10 +450,10 @@ fig10.add_trace(go.Bar(
     hovertemplate="<b>%{y}</b><br>%{x:,} not merged<extra></extra>",
 ))
 fig10.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="All-Time PR Leaderboard — Top 20 Contributors", font=dict(size=16, color=TEXT), x=0),
     barmode="stack",
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
+    legend=dict(orientation="h", x=0, y=1.12, bgcolor="rgba(0,0,0,0)"),
     xaxis=dict(gridcolor=BORDER, title="Pull Requests"),
     yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
     height=560,
@@ -487,7 +467,7 @@ hour_df = con.execute("""
     GROUP BY hour_utc ORDER BY hour_utc
 """).df()
 
-def _hour_color(h: int) -> str:
+def _hour_color(h):
     if 13 <= h <= 17: return ORANGE
     if  9 <= h <= 20: return BLUE
     return "#1e3a5f"
@@ -542,7 +522,7 @@ fig12.add_trace(go.Bar(
     showlegend=False,
 ), row=1, col=2)
 fig12.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="Codebase Hotspots — Where Work Happens", font=dict(size=16, color=TEXT), x=0),
     xaxis=dict(gridcolor=BORDER),
     xaxis2=dict(gridcolor=BORDER),
@@ -582,7 +562,7 @@ survival_df = con.execute("""
 _day_labels = {0:"Same day",1:"1 day",3:"3 days",7:"1 week",14:"2 weeks",
                30:"1 month",60:"2 months",90:"3 months",180:"6 months",
                365:"1 year",730:"2 years+"}
-survival_df["label"] = survival_df["days"].replace(_day_labels)
+survival_df["label"] = survival_df["days"].map(_day_labels)
 
 fig13 = go.Figure()
 fig13.add_trace(go.Scatter(
@@ -602,10 +582,9 @@ fig13.update_layout(**base_layout(
 
 # ── 14. Bug Label Co-occurrence ───────────────────────────────────────────────
 
-_bug_row = con.execute(
+TOTAL_BUG_PRS = con.execute(
     "SELECT COUNT(DISTINCT pr_number) FROM pr_labels WHERE label_name = 'bug'"
-).fetchone()
-TOTAL_BUG_PRS: int = _bug_row[0] if _bug_row else 0
+).fetchone()[0]
 
 bug_co = con.execute("""
     SELECT b.label_name AS co_label, COUNT(*) AS cnt
@@ -622,7 +601,7 @@ bug_co = con.execute("""
 bug_co["pct"] = (100 * bug_co["cnt"] / TOTAL_BUG_PRS).round(1)
 bug_co["display"] = bug_co["co_label"].str.replace(r"^(topic:|platform:)", "", regex=True)
 
-def _bug_label_color(name: str) -> str:
+def _bug_label_color(name):
     if name.startswith("topic:"):    return BLUE
     if name.startswith("platform:"): return ORANGE
     if name == "regression":         return RED
@@ -711,7 +690,7 @@ lift_df = con.execute("""
 
 lift_df["display"] = lift_df["label_name"].str.replace(r"^(topic:|platform:)", "", regex=True)
 
-def _lift_bar_color(lift: float) -> str:
+def _lift_bar_color(lift):
     if lift >= 1.8: return "#c0392b"
     if lift >= 1.3: return RED
     if lift >= 1.1: return ORANGE
@@ -749,11 +728,17 @@ fig15.update_layout(margin=dict(l=20, r=80, t=80, b=20))
 
 # ── 16. Bug Association Scatter — Volume vs. Lift ─────────────────────────────
 
-ANNOTATE_LABELS: list[str] = [
+ANNOTATE_LABELS = {
     "crash", "regression", "feature proposal", "topic:editor",
     "performance", "topic:input", "topic:codestyle", "documentation",
     "usability", "topic:rendering", "topic:gdscript",
-]
+}
+
+def _scatter_cat(name):
+    if name.startswith("topic:"):        return "Topic",    BLUE
+    if name.startswith("platform:"):     return "Platform", ORANGE
+    if name in ("crash", "regression"):  return "Severity", RED
+    return "Other", PURPLE
 
 fig16 = go.Figure()
 for cat_key, cat_label, color in [
@@ -798,11 +783,11 @@ fig16.add_hline(y=1.0, line_color=MUTED, line_dash="dash", line_width=1.5,
                 annotation_text="lift = 1.0 (baseline)", annotation_position="right",
                 annotation_font=dict(color=MUTED, size=10))
 fig16.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="Bug Association Map — Volume vs. Statistical Lift", font=dict(size=16, color=TEXT), x=0),
     xaxis=dict(type="log", gridcolor=BORDER, title="Co-occurrences with 'bug' (log scale)"),
     yaxis=dict(gridcolor=BORDER, title="Lift  (×baseline rate)", range=[-0.15, 2.35]),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
+    legend=dict(orientation="h", x=0, y=1.13, bgcolor="rgba(0,0,0,0)"),
     hovermode="closest",
 ))
 
@@ -863,16 +848,18 @@ DIR_COLORS = {
     "servers": PURPLE, "platform": RED, "drivers": CYAN,
     "core": YELLOW,
 }
-file_bug_df["dir_color"] = file_bug_df["top_dir"].apply(lambda d: DIR_COLORS.get(str(d), MUTED))
+file_bug_df["dir_color"] = file_bug_df["top_dir"].map(DIR_COLORS).fillna(MUTED)
 file_bug_df["marker_size"] = (file_bug_df["open_bug_prs"].clip(1) ** 0.55 * 5).clip(7, 42)
 
 # ── 17. Bug-Prone File Scatter ─────────────────────────────────────────────────
 
-ANNOTATE_FILES: list[str] = file_bug_df[
-    (file_bug_df["bug_prs"] >= 90) |
-    (file_bug_df["lift"] >= 1.2) |
-    (file_bug_df["open_bug_prs"] >= 28)
-]["filename"].tolist()
+ANNOTATE_FILES = set(
+    file_bug_df[
+        (file_bug_df["bug_prs"] >= 90) |
+        (file_bug_df["lift"] >= 1.2) |
+        (file_bug_df["open_bug_prs"] >= 28)
+    ]["filename"]
+)
 
 fig17 = go.Figure()
 for top_dir, color in {**DIR_COLORS, "other": MUTED}.items():
@@ -909,7 +896,7 @@ fig17.add_trace(go.Scatter(
 ))
 
 # Quadrant shading regions
-median_bugs: float = float(file_bug_df["bug_prs"].median())  # pyright: ignore[reportArgumentType]
+median_bugs = float(file_bug_df["bug_prs"].median())
 fig17.add_vline(x=median_bugs, line_color=BORDER, line_dash="dot", line_width=1)
 fig17.add_hline(y=1.0, line_color=MUTED, line_dash="dash", line_width=1.5,
                 annotation_text="lift = 1.0  (baseline)", annotation_position="right",
@@ -926,11 +913,11 @@ for txt, x, y in [
     )
 
 fig17.update_layout(**base_layout(
-    t=130,
+    t=100,
     title=dict(text="File Bug Proneness — Volume vs. Lift  (bubble = open bug backlog)", font=dict(size=16, color=TEXT), x=0),
     xaxis=dict(type="log", gridcolor=BORDER, title="Total bug PRs touching this file (log scale)"),
     yaxis=dict(gridcolor=BORDER, title="Lift  (×baseline)", range=[0.3, 1.65]),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+    legend=dict(orientation="h", x=0, y=1.13, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
     hovermode="closest",
 ))
 
@@ -971,703 +958,6 @@ fig18.update_layout(**base_layout(
     height=680,
 ))
 
-# ── TIER 1-3: Deep Analytics ─────────────────────────────────────────────────
-# ── 19. Merge Time Trend (A1) ─────────────────────────────────────────────────
-
-ttm_trend = con.execute("""
-    SELECT YEAR(created_at) yr,
-           CAST(MEDIAN(DATEDIFF('day', created_at, merged_at)) AS INTEGER) median_days,
-           ROUND(AVG(DATEDIFF('day', created_at, merged_at)), 1) mean_days,
-           COUNT(*) merged_count
-    FROM pull_requests WHERE merged_at IS NOT NULL
-    GROUP BY yr ORDER BY yr
-""").df()
-
-fig19 = go.Figure()
-fig19.add_trace(go.Bar(
-    x=ttm_trend["yr"], y=ttm_trend["merged_count"],
-    name="Merged PRs", marker_color=BLUE, opacity=0.22, yaxis="y2",
-    hovertemplate="<b>%{x}</b><br>%{y:,} merged<extra></extra>",
-))
-fig19.add_trace(go.Scatter(
-    x=ttm_trend["yr"], y=ttm_trend["median_days"],
-    mode="lines+markers", name="Median Days to Merge",
-    line=dict(color=GREEN, width=3), marker=dict(size=10, color=GREEN),
-    hovertemplate="<b>%{x}</b><br>Median: %{y} days<extra></extra>",
-))
-fig19.add_trace(go.Scatter(
-    x=ttm_trend["yr"], y=ttm_trend["mean_days"],
-    mode="lines+markers", name="Mean Days to Merge",
-    line=dict(color=ORANGE, width=2.5, dash="dash"), marker=dict(size=8, color=ORANGE),
-    hovertemplate="<b>%{x}</b><br>Mean: %{y:.1f} days<extra></extra>",
-))
-fig19.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Merge Speed Over Time — Is the Project Keeping Up?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(dtick=1, gridcolor=BORDER, title="Year"),
-    yaxis=dict(gridcolor=BORDER, title="Days to Merge"),
-    yaxis2=dict(overlaying="y", side="right", gridcolor="rgba(0,0,0,0)", title="Merged PRs"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    hovermode="x unified",
-))
-
-# ── 20. Time-to-First-Review (A2) ─────────────────────────────────────────────
-
-ttfr = con.execute("""
-    SELECT YEAR(pr.created_at) yr,
-           CAST(MEDIAN(DATEDIFF('hour', pr.created_at, r.first_review_at)) AS INTEGER) median_hours,
-           ROUND(AVG(DATEDIFF('hour', pr.created_at, r.first_review_at)), 1) mean_hours,
-           COUNT(*) pr_count
-    FROM pull_requests pr
-    JOIN (SELECT pr_number, MIN(submitted_at) first_review_at
-          FROM pr_reviews GROUP BY pr_number) r ON pr.number = r.pr_number
-    GROUP BY yr HAVING COUNT(*) >= 5 ORDER BY yr
-""").df()
-ttfr["median_days"] = (ttfr["median_hours"] / 24.0).round(1)
-ttfr["mean_days"]   = (ttfr["mean_hours"] / 24.0).round(1)
-
-fig20 = go.Figure()
-fig20.add_trace(go.Bar(
-    x=ttfr["yr"], y=ttfr["pr_count"],
-    name="PRs Reviewed", marker_color=BLUE, opacity=0.22, yaxis="y2",
-    hovertemplate="<b>%{x}</b><br>%{y:,} PRs got ≥1 review<extra></extra>",
-))
-fig20.add_trace(go.Scatter(
-    x=ttfr["yr"], y=ttfr["median_days"],
-    mode="lines+markers", name="Median Time to First Review",
-    line=dict(color=CYAN, width=3), marker=dict(size=10, color=CYAN),
-    hovertemplate="<b>%{x}</b><br>Median: %{y:.1f} days<extra></extra>",
-))
-fig20.add_trace(go.Scatter(
-    x=ttfr["yr"], y=ttfr["mean_days"],
-    mode="lines+markers", name="Mean Time to First Review",
-    line=dict(color=PURPLE, width=2.5, dash="dash"), marker=dict(size=8, color=PURPLE),
-    hovertemplate="<b>%{x}</b><br>Mean: %{y:.1f} days<extra></extra>",
-))
-fig20.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Time-to-First-Review — How Long Before Someone Looks?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(dtick=1, gridcolor=BORDER, title="Year"),
-    yaxis=dict(gridcolor=BORDER, title="Days Until First Review"),
-    yaxis2=dict(overlaying="y", side="right", gridcolor="rgba(0,0,0,0)", title="PRs Reviewed"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    hovermode="x unified",
-))
-
-# ── 21. Review Iterations per PR (A3) ─────────────────────────────────────────
-
-iterations = con.execute("""
-    SELECT YEAR(pr.created_at) yr,
-           CAST(MEDIAN(rc.review_count) AS INTEGER) median_rounds,
-           ROUND(AVG(rc.review_count), 1) mean_rounds,
-           COUNT(*) pr_count
-    FROM pull_requests pr
-    JOIN (SELECT pr_number, COUNT(*) review_count FROM pr_reviews GROUP BY pr_number) rc
-      ON pr.number = rc.pr_number
-    WHERE pr.merged_at IS NOT NULL
-    GROUP BY yr ORDER BY yr
-""").df()
-
-fig21 = go.Figure()
-fig21.add_trace(go.Bar(
-    x=iterations["yr"], y=iterations["pr_count"],
-    name="Merged PRs", marker_color=BLUE, opacity=0.22, yaxis="y2",
-    hovertemplate="<b>%{x}</b><br>%{y:,} merged PRs<extra></extra>",
-))
-fig21.add_trace(go.Scatter(
-    x=iterations["yr"], y=iterations["median_rounds"],
-    mode="lines+markers", name="Median Review Rounds",
-    line=dict(color=GREEN, width=3), marker=dict(size=10, color=GREEN),
-    hovertemplate="<b>%{x}</b><br>Median: %{y} rounds<extra></extra>",
-))
-fig21.add_trace(go.Scatter(
-    x=iterations["yr"], y=iterations["mean_rounds"],
-    mode="lines+markers", name="Mean Review Rounds",
-    line=dict(color=ORANGE, width=2.5, dash="dash"), marker=dict(size=8, color=ORANGE),
-    hovertemplate="<b>%{x}</b><br>Mean: %{y:.1f} rounds<extra></extra>",
-))
-fig21.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Review Iterations — How Many Rounds Before Merge?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(dtick=1, gridcolor=BORDER, title="Year"),
-    yaxis=dict(gridcolor=BORDER, title="Review Rounds"),
-    yaxis2=dict(overlaying="y", side="right", gridcolor="rgba(0,0,0,0)", title="Merged PRs"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    hovermode="x unified",
-))
-
-# ── 22. Day-of-Week Patterns (A4) ─────────────────────────────────────────────
-
-dow = con.execute("""
-    SELECT DAYNAME(created_at) dow,
-           COUNT(*) created,
-           SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged,
-           ROUND(100.0 * SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) merge_rate
-    FROM pull_requests
-    GROUP BY dow
-""").df()
-dow_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-dow["ord"] = dow["dow"].apply(lambda d: dow_order.index(d) if d in dow_order else 99)
-dow = dow.sort_values("ord")
-dow_colors = [BLUE if d < 5 else PURPLE for d in dow["ord"]]
-
-fig22 = make_subplots(rows=1, cols=2,
-    subplot_titles=["PRs Created by Day of Week", "Merge Rate by Day of Week"],
-    column_widths=[0.55, 0.45])
-fig22.add_trace(go.Bar(
-    x=dow["dow"], y=dow["created"],
-    marker_color=dow_colors,
-    hovertemplate="<b>%{x}</b><br>%{y:,} PRs created<extra></extra>",
-    showlegend=False,
-), row=1, col=1)
-fig22.add_trace(go.Bar(
-    x=dow["dow"], y=dow["merge_rate"],
-    marker_color=dow_colors,
-    text=[f"{r}%" for r in dow["merge_rate"]],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=11),
-    hovertemplate="<b>%{x}</b><br>%{y:.1f}% merge rate<extra></extra>",
-    showlegend=False,
-), row=1, col=2)
-fig22.update_layout(**base_layout(
-    t=130,
-    title=dict(text="The Weekly Rhythm — PR Activity by Day of Week", font=dict(size=16, color=TEXT), x=0),
-    yaxis=dict(gridcolor=BORDER, title="PRs Created"),
-    yaxis2=dict(gridcolor=BORDER, range=[0, 105], ticksuffix="%", title="Merge Rate"),
-    xaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    xaxis2=dict(gridcolor="rgba(0,0,0,0)"),
-))
-fig22.update_annotations(font_color=MUTED)
-
-# ── 23. Reviewer Response Time (A5) ───────────────────────────────────────────
-
-rev_resp = con.execute("""
-    WITH reviewer_times AS (
-        SELECT r.reviewer_login,
-               DATEDIFF('hour', pr.created_at, r.submitted_at) response_hours
-        FROM pr_reviews r
-        JOIN pull_requests pr ON r.pr_number = pr.number
-        WHERE r.reviewer_login IS NOT NULL
-          AND DATEDIFF('hour', pr.created_at, r.submitted_at) >= 0
-    ),
-    reviewer_stats AS (
-        SELECT reviewer_login,
-               COUNT(*) review_count,
-               CAST(MEDIAN(response_hours) AS INTEGER) median_resp_hours,
-               ROUND(AVG(response_hours), 1) mean_resp_hours
-        FROM reviewer_times
-        GROUP BY reviewer_login
-        HAVING COUNT(*) >= 50
-    )
-    SELECT * FROM reviewer_stats
-    ORDER BY median_resp_hours DESC LIMIT 20
-""").df()
-rev_resp["median_days"] = (rev_resp["median_resp_hours"] / 24.0).round(1)
-rev_resp["mean_days"]   = (rev_resp["mean_resp_hours"] / 24.0).round(1)
-rev_resp = rev_resp.sort_values("median_days")  # fastest at top
-
-fig23 = go.Figure(go.Bar(
-    x=rev_resp["median_days"], y=rev_resp["reviewer_login"],
-    orientation="h",
-    marker=dict(color=rev_resp["median_days"],
-                colorscale=[[0, GREEN],[0.5, YELLOW],[1, RED]], showscale=True,
-                colorbar=dict(title="Days", title_font_color=TEXT, tickfont_color=TEXT)),
-    text=[f"{d}d  ({c:,} reviews)" for d, c in zip(rev_resp["median_days"], rev_resp["review_count"])],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=10),
-    hovertemplate="<b>%{y}</b><br>Median response: %{x:.1f} days<br>Mean: %{customdata[0]:.1f} days<br>%{customdata[1]:,} reviews<extra></extra>",
-    customdata=list(zip(rev_resp["mean_days"], rev_resp["review_count"])),
-    width=0.7,
-))
-fig23.update_layout(**base_layout(
-    title=dict(text="Reviewer Response Time — Gatekeeper Speed Rankings (≥50 reviews)", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title="Median Days to Respond"),
-    yaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    showlegend=False,
-    height=550,
-))
-fig23.update_layout(margin=dict(l=20, r=80, t=50, b=20))
-
-# ── 24. First-Timer Merge Rate Over Time (B1) ─────────────────────────────────
-
-first_timer = con.execute("""
-    SELECT YEAR(created_at) yr,
-           COUNT(*) total,
-           SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged,
-           ROUND(100.0 * SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) merge_rate
-    FROM pull_requests
-    WHERE author_association = 'NONE'
-    GROUP BY yr HAVING COUNT(*) >= 20 ORDER BY yr
-""").df()
-
-fig24 = go.Figure()
-fig24.add_trace(go.Bar(
-    x=first_timer["yr"], y=first_timer["total"],
-    name="First-Timer PRs", marker_color=BLUE, opacity=0.4, yaxis="y2",
-    hovertemplate="<b>%{x}</b><br>%{y:,} PRs<extra></extra>",
-))
-fig24.add_trace(go.Scatter(
-    x=first_timer["yr"], y=first_timer["merge_rate"],
-    mode="lines+markers", name="First-Timer Merge Rate %",
-    line=dict(color=GREEN, width=3), marker=dict(size=10, color=GREEN),
-    hovertemplate="<b>%{x}</b><br>%{y:.1f}% merge rate<extra></extra>",
-))
-fig24.update_layout(**base_layout(
-    t=130,
-    title=dict(text="First-Timer Merge Rate — Is It Getting Harder for Newcomers?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(dtick=1, gridcolor=BORDER, title="Year"),
-    yaxis=dict(gridcolor=BORDER, title="Merge Rate %", range=[0, 105], ticksuffix="%"),
-    yaxis2=dict(overlaying="y", side="right", gridcolor="rgba(0,0,0,0)", title="First-Timer PR Volume"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    hovermode="x unified",
-))
-
-# ── 25. Contributor Retention (B2) ────────────────────────────────────────────
-
-retention = con.execute("""
-    WITH author_first_pr AS (
-        SELECT author_login, MIN(created_at) first_pr_date,
-               YEAR(MIN(created_at)) first_year
-        FROM pull_requests
-        WHERE author_login IS NOT NULL AND author_login != 'ghost'
-        GROUP BY author_login
-    ),
-    ret AS (
-        SELECT afp.first_year,
-               COUNT(DISTINCT afp.author_login) first_timers,
-               COUNT(DISTINCT CASE WHEN pr.created_at > afp.first_pr_date
-                   AND DATEDIFF('month', afp.first_pr_date, pr.created_at) <= 12
-                   THEN afp.author_login END) returned_within_12m
-        FROM author_first_pr afp
-        LEFT JOIN pull_requests pr ON afp.author_login = pr.author_login
-        GROUP BY afp.first_year
-        HAVING first_year <= 2024
-    )
-    SELECT first_year, first_timers, returned_within_12m,
-           ROUND(100.0 * returned_within_12m / first_timers, 1) retention_pct
-    FROM ret ORDER BY first_year
-""").df()
-
-fig25 = make_subplots(rows=1, cols=2,
-    subplot_titles=["First-Time Contributors per Year", "12-Month Retention Rate"],
-    column_widths=[0.5, 0.5])
-fig25.add_trace(go.Bar(
-    x=retention["first_year"], y=retention["first_timers"],
-    name="Total Newcomers", marker_color=BLUE,
-    hovertemplate="<b>%{x}</b><br>%{y:,} new authors<extra></extra>",
-    showlegend=False,
-), row=1, col=1)
-fig25.add_trace(go.Bar(
-    x=retention["first_year"], y=retention["returned_within_12m"],
-    name="Returned", marker_color=GREEN,
-    hovertemplate="<b>%{x}</b><br>%{y:,} returned<extra></extra>",
-    showlegend=False,
-), row=1, col=1)
-fig25.add_trace(go.Scatter(
-    x=retention["first_year"], y=retention["retention_pct"],
-    mode="lines+markers", name="Retention %",
-    line=dict(color=ORANGE, width=3), marker=dict(size=10, color=ORANGE),
-    hovertemplate="<b>%{x}</b><br>%{y:.1f}% returned<extra></extra>",
-    showlegend=False,
-), row=1, col=2)
-fig25.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Contributor Stickiness — Do Newcomers Come Back?", font=dict(size=16, color=TEXT), x=0),
-    barmode="stack",
-    yaxis=dict(gridcolor=BORDER, title="Count"),
-    yaxis2=dict(gridcolor=BORDER, range=[0, 105], ticksuffix="%", title="Retention %"),
-    xaxis=dict(dtick=2, gridcolor="rgba(0,0,0,0)"),
-    xaxis2=dict(dtick=2, gridcolor="rgba(0,0,0,0)"),
-))
-fig25.update_annotations(font_color=MUTED)
-
-# ── 26. Stale PR Predictors (B3) ──────────────────────────────────────────────
-
-stale = con.execute("""
-    WITH pr_meta AS (
-        SELECT number, state,
-               COALESCE(additions + deletions, 0) total_lines,
-               COALESCE(LENGTH(body), 0) desc_len,
-               author_association, comments,
-               (SELECT COUNT(*) FROM pr_labels l WHERE l.pr_number = p.number) label_count,
-               (SELECT COUNT(*) FROM pr_files f WHERE f.pr_number = p.number) file_count,
-               CASE WHEN state = 'open' AND DATEDIFF('day', created_at, CURRENT_DATE()) > 365
-                    THEN 1 ELSE 0 END is_stale
-        FROM pull_requests p
-        WHERE (state = 'open' OR merged_at IS NOT NULL) AND created_at IS NOT NULL
-    )
-    SELECT
-        CASE
-            WHEN total_lines = 0    THEN '0 lines'
-            WHEN total_lines <= 10  THEN 'Tiny (≤10)'
-            WHEN total_lines <= 100  THEN 'Small (≤100)'
-            WHEN total_lines <= 500  THEN 'Medium (≤500)'
-            WHEN total_lines <= 2000 THEN 'Large (≤2k)'
-            ELSE                          'Huge (2k+)'
-        END size_bucket,
-        CASE WHEN total_lines = 0 THEN 1 WHEN total_lines <= 10 THEN 2
-             WHEN total_lines <= 100 THEN 3 WHEN total_lines <= 500 THEN 4
-             WHEN total_lines <= 2000 THEN 5 ELSE 6 END ord,
-        COUNT(*) total,
-        SUM(is_stale) stale_count,
-        ROUND(100.0 * SUM(is_stale) / NULLIF(COUNT(*), 0), 1) stale_rate
-    FROM pr_meta WHERE total_lines >= 0
-    GROUP BY size_bucket, ord ORDER BY ord
-""").df()
-
-fig26 = go.Figure(go.Bar(
-    x=stale["size_bucket"], y=stale["stale_rate"],
-    marker_color=[BLUE, CYAN, GREEN, YELLOW, ORANGE, RED][:len(stale)],
-    text=[f"{r}%" for r in stale["stale_rate"]],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=12),
-    customdata=list(zip(stale["total"], stale["stale_count"])),
-    hovertemplate="<b>%{x}</b><br>%{y:.1f}% stale<br>%{customdata[1]:,} of %{customdata[0]:,} PRs still open after 1yr<extra></extra>",
-))
-fig26.update_layout(**base_layout(
-    title=dict(text="What Makes a PR Go Stale? — Stale Rate by PR Size", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor="rgba(0,0,0,0)", title="PR Size (additions + deletions)"),
-    yaxis=dict(gridcolor=BORDER, title="% Still Open After 1 Year", ticksuffix="%", range=[0, 25]),
-    showlegend=False,
-))
-
-# ── 27. Co-edited File Coupling (B4) ──────────────────────────────────────────
-
-coupling = con.execute("""
-    WITH pairs AS (
-        SELECT a.filename file1, b.filename file2, COUNT(DISTINCT a.pr_number) co_count
-        FROM pr_files a
-        JOIN pr_files b ON a.pr_number = b.pr_number AND a.filename < b.filename
-        GROUP BY a.filename, b.filename
-        HAVING co_count >= 18
-        ORDER BY co_count DESC LIMIT 25
-    )
-    SELECT
-        regexp_extract(file1, '[^/]+$') base1,
-        regexp_extract(file2, '[^/]+$') base2,
-        file1, file2, co_count
-    FROM pairs
-""").df()
-coupling["display"] = coupling["base1"] + "  ↔  " + coupling["base2"]
-coupling = coupling.sort_values("co_count")
-
-fig27 = go.Figure(go.Bar(
-    x=coupling["co_count"], y=coupling["display"],
-    orientation="h",
-    marker_color=ORANGE,
-    text=[f"{c} PRs" for c in coupling["co_count"]],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=10),
-    customdata=list(zip(coupling["file1"], coupling["file2"])),
-    hovertemplate="<b>%{customdata[0]}</b><br>↔ <b>%{customdata[1]}</b><br>%{x:,} PRs changed both<extra></extra>",
-    width=0.7,
-))
-fig27.update_layout(**base_layout(
-    title=dict(text="File Coupling — Which Files Are Always Changed Together?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title="Number of PRs Changing Both"),
-    yaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    showlegend=False,
-    height=680,
-))
-fig27.update_layout(margin=dict(l=20, r=80, t=50, b=20))
-
-# ── 28. Review Depth vs Merge Speed (B5) ──────────────────────────────────────
-
-rev_depth = con.execute("""
-    WITH pr_rd AS (
-        SELECT p.number,
-               DATEDIFF('day', p.created_at, p.merged_at) ttm_days,
-               COALESCE(rc.comment_count, 0) comment_count,
-               COALESCE(rv.review_count, 0) review_count
-        FROM pull_requests p
-        LEFT JOIN (SELECT pr_number, COUNT(*) comment_count FROM pr_review_comments GROUP BY pr_number) rc
-          ON p.number = rc.pr_number
-        LEFT JOIN (SELECT pr_number, COUNT(*) review_count FROM pr_reviews GROUP BY pr_number) rv
-          ON p.number = rv.pr_number
-        WHERE p.merged_at IS NOT NULL
-          AND DATEDIFF('day', p.created_at, p.merged_at) BETWEEN 0 AND 365
-    )
-    SELECT
-        CASE
-            WHEN review_count = 0  THEN '0 reviews'
-            WHEN review_count = 1  THEN '1 review'
-            WHEN review_count <= 3 THEN '2-3 reviews'
-            WHEN review_count <= 5 THEN '4-5 reviews'
-            ELSE                       '6+ reviews'
-        END review_bucket,
-        CASE WHEN review_count = 0 THEN 0 WHEN review_count = 1 THEN 1
-             WHEN review_count <= 3 THEN 2 WHEN review_count <= 5 THEN 3 ELSE 4 END ord,
-        COUNT(*) pr_count,
-        CAST(MEDIAN(ttm_days) AS INTEGER) median_ttm,
-        ROUND(AVG(ttm_days), 1) mean_ttm,
-        ROUND(AVG(comment_count), 1) avg_inline_comments
-    FROM pr_rd
-    GROUP BY review_bucket, ord ORDER BY ord
-""").df()
-
-bubble_colors = [GREEN, CYAN, BLUE, YELLOW, ORANGE]
-fig28 = make_subplots(rows=1, cols=2,
-    subplot_titles=["PRs by Review Depth", "Median TTM by Review Depth"],
-    column_widths=[0.45, 0.55])
-fig28.add_trace(go.Bar(
-    x=rev_depth["review_bucket"], y=rev_depth["pr_count"],
-    marker_color=bubble_colors[:len(rev_depth)],
-    hovertemplate="<b>%{x}</b><br>%{y:,} PRs<extra></extra>",
-    showlegend=False,
-), row=1, col=1)
-fig28.add_trace(go.Bar(
-    x=rev_depth["review_bucket"], y=rev_depth["median_ttm"],
-    marker_color=bubble_colors[:len(rev_depth)],
-    text=[f"{d}d" for d in rev_depth["median_ttm"]],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=11),
-    hovertemplate="<b>%{x}</b><br>Median: %{y} days to merge<br>Mean: %{customdata[0]:.1f} days<br>Avg inline comments: %{customdata[1]:.1f}<extra></extra>",
-    customdata=list(zip(rev_depth["mean_ttm"], rev_depth["avg_inline_comments"])),
-    showlegend=False,
-), row=1, col=2)
-fig28.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Review Depth vs Merge Speed — More Reviews = Slower or Faster?", font=dict(size=16, color=TEXT), x=0),
-    yaxis=dict(gridcolor=BORDER, title="Number of PRs"),
-    yaxis2=dict(gridcolor=BORDER, title="Median Days to Merge"),
-    xaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    xaxis2=dict(gridcolor="rgba(0,0,0,0)"),
-))
-fig28.update_annotations(font_color=MUTED)
-
-# ── 29. PR Description Quality vs Outcome (C1) ────────────────────────────────
-
-desc_impact = con.execute("""
-    SELECT
-        CASE
-            WHEN COALESCE(LENGTH(body), 0) = 0    THEN 'No description'
-            WHEN LENGTH(body) <= 100               THEN 'Brief (≤100)'
-            WHEN LENGTH(body) <= 500               THEN 'Medium (≤500)'
-            WHEN LENGTH(body) <= 2000              THEN 'Long (≤2k)'
-            ELSE                                        'Very Long (2k+)'
-        END desc_len,
-        CASE WHEN COALESCE(LENGTH(body), 0) = 0 THEN 0 WHEN LENGTH(body) <= 100 THEN 1
-             WHEN LENGTH(body) <= 500 THEN 2 WHEN LENGTH(body) <= 2000 THEN 3 ELSE 4 END ord,
-        COUNT(*) total,
-        SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged,
-        ROUND(100.0 * SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) merge_rate
-    FROM pull_requests
-    WHERE (state != 'open' OR merged_at IS NOT NULL)
-      AND created_at >= CURRENT_DATE() - INTERVAL 2 YEAR
-    GROUP BY desc_len, ord ORDER BY ord
-""").df()
-
-desc_impact["not_merged"] = desc_impact["total"] - desc_impact["merged"]
-
-fig29 = go.Figure()
-fig29.add_trace(go.Bar(
-    x=desc_impact["desc_len"], y=desc_impact["merged"],
-    name="Merged", marker_color=GREEN,
-    customdata=list(zip(desc_impact["merge_rate"], desc_impact["total"])),
-    hovertemplate="<b>%{x}</b><br>%{y:,} merged (%{customdata[0]:.1f}% of %{customdata[1]:,})<extra></extra>",
-))
-fig29.add_trace(go.Bar(
-    x=desc_impact["desc_len"], y=desc_impact["not_merged"],
-    name="Closed (unmerged)", marker_color=RED,
-    customdata=list(zip(desc_impact["merge_rate"], desc_impact["total"])),
-    hovertemplate="<b>%{x}</b><br>%{y:,} not merged (%{customdata[0]:.1f}% merge rate, n=%{customdata[1]:,})<extra></extra>",
-))
-fig29.update_layout(**base_layout(
-    t=130,
-    title=dict(text="Description Length vs Merge Outcome — Last 2 Years (bar height = volume, green share = merge rate)", font=dict(size=16, color=TEXT), x=0),
-    barmode="stack",
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    xaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    yaxis=dict(gridcolor=BORDER, title="Closed PRs"),
-))
-
-# ── 30. Title Keyword Lift (C2) ───────────────────────────────────────────────
-
-title_words = con.execute("""
-    WITH words AS (
-        SELECT LOWER(TRIM(REGEXP_REPLACE(SPLIT_PART(title, ' ', 1), '[^a-zA-Z]', '', 'g'))) word,
-               COUNT(*) total,
-               SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged
-        FROM pull_requests
-        WHERE title IS NOT NULL AND title != ''
-        GROUP BY word
-        HAVING COUNT(*) >= 40
-    ),
-    totals AS (
-        SELECT COUNT(*) overall, SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged_overall
-        FROM pull_requests
-    )
-    SELECT word, total, merged,
-           ROUND(100.0 * merged / total, 1) merge_rate,
-           ROUND((merged::DOUBLE / t.merged_overall) / (total::DOUBLE / t.overall), 2) lift
-    FROM words CROSS JOIN totals t
-    WHERE word != '' AND LENGTH(word) > 1
-    ORDER BY total DESC LIMIT 30
-""").df()
-title_words = title_words.sort_values("lift")
-title_lift_colors = [
-    RED if l < 0.7 else ORANGE if l < 0.9 else YELLOW if l < 1.0 else CYAN if l < 1.1 else BLUE if l < 1.2 else GREEN
-    for l in title_words["lift"]
-]
-
-fig30 = go.Figure(go.Bar(
-    x=title_words["lift"], y=title_words["word"],
-    orientation="h",
-    marker_color=title_lift_colors,
-    text=[f"{v:.2f}×" for v in title_words["lift"]],
-    textposition="outside",
-    textfont=dict(color=TEXT, size=10),
-    customdata=list(zip(title_words["total"], title_words["merge_rate"])),
-    hovertemplate="<b>%{y}</b><br>Lift: %{x:.3f}×<br>%{customdata[0]:,} PRs  (%{customdata[1]:.1f}% merge rate)<extra></extra>",
-    width=0.7,
-))
-fig30.add_vline(x=1.0, line_color=MUTED, line_dash="dash", line_width=1.5,
-                annotation_text="baseline", annotation_position="bottom",
-                annotation_font=dict(color=MUTED, size=10))
-fig30.update_layout(**base_layout(
-    title=dict(text="Title Keyword Lift — Which Opening Words Predict Merge Success?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title="Lift  (1.0 = same rate as all PRs)"),
-    yaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    showlegend=False,
-    height=680,
-))
-fig30.update_layout(margin=dict(l=20, r=80, t=50, b=20))
-
-# ── 31. Reviewer-Author Network (C3) ──────────────────────────────────────────
-
-network = con.execute("""
-    SELECT r.reviewer_login, pr.author_login,
-           COUNT(*) weight
-    FROM pr_reviews r
-    JOIN pull_requests pr ON r.pr_number = pr.number
-    WHERE r.reviewer_login IS NOT NULL AND pr.author_login IS NOT NULL
-      AND r.reviewer_login != pr.author_login
-    GROUP BY r.reviewer_login, pr.author_login
-    HAVING COUNT(*) >= 8
-    ORDER BY weight DESC LIMIT 35
-""").df()
-network["pair_label"] = network["reviewer_login"] + " → " + network["author_login"]
-network = network.sort_values("weight")
-
-fig31 = go.Figure(go.Bar(
-    x=network["weight"], y=network["pair_label"],
-    orientation="h",
-    marker=dict(color=network["weight"],
-                colorscale=[[0, BLUE],[0.5, PURPLE],[1, ORANGE]], showscale=False),
-    hovertemplate="<b>%{y}</b><br>%{x:,} reviews<extra></extra>",
-    width=0.7,
-))
-fig31.update_layout(**base_layout(
-    title=dict(text="Reviewer → Author Network — Who Reviews Whom?", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title="Number of Reviews"),
-    yaxis=dict(gridcolor="rgba(0,0,0,0)"),
-    showlegend=False,
-    height=800,
-))
-fig31.update_layout(margin=dict(l=20, r=60, t=50, b=20))
-
-# ── 32. Monthly Volume with Event Annotations (C4) ────────────────────────────
-
-monthly_vol = con.execute("""
-    SELECT DATE_TRUNC('month', created_at)::DATE mnth,
-           COUNT(*) opened,
-           SUM(CASE WHEN merged_at IS NOT NULL THEN 1 ELSE 0 END) merged
-    FROM pull_requests
-    GROUP BY mnth ORDER BY mnth
-""").df()
-
-fig32 = go.Figure()
-fig32.add_trace(go.Scatter(
-    x=monthly_vol["mnth"], y=monthly_vol["opened"],
-    mode="lines", name="Opened",
-    line=dict(color=BLUE, width=1.5),
-    hovertemplate="<b>%{x|%b %Y}</b><br>%{y:,} opened<extra></extra>",
-))
-fig32.add_trace(go.Scatter(
-    x=monthly_vol["mnth"], y=monthly_vol["merged"],
-    mode="lines", name="Merged",
-    line=dict(color=GREEN, width=1.5),
-    fill="tozeroy", fillcolor="rgba(63,185,80,0.1)",
-    hovertemplate="<b>%{x|%b %Y}</b><br>%{y:,} merged<extra></extra>",
-))
-# Annotate key events
-events = {
-    "2018-01-29": "Godot 3.0",
-    "2020-01-29": "Godot 3.2",
-    "2021-03-03": "Godot 3.3",
-    "2022-09-12": "Unity Fee¹",
-    "2023-03-01": "Godot 4.0",
-    "2023-09-12": "Unity Pricing²",
-    "2024-01-01": "Godot 4.2",
-}
-for dt_str, label in events.items():
-    fig32.add_shape(type="line", x0=dt_str, x1=dt_str, y0=0, y1=1, yref="paper",
-                    line=dict(color=ORANGE, dash="dot", width=1.2))
-    fig32.add_annotation(x=dt_str, y=1.02, yref="paper", text=label,
-                         showarrow=False, font=dict(color=MUTED, size=9),
-                         xanchor="center", yanchor="bottom")
-fig32.update_layout(**base_layout(
-    t=110,
-    title=dict(text="PR Volume Over Time — Events That Shaped the Community", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title=""),
-    yaxis=dict(gridcolor=BORDER, title="PRs per Month"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)"),
-    hovermode="x unified",
-))
-
-# ── 33. Reviewer Burnout Detection (C5) ───────────────────────────────────────
-
-burnout = con.execute("""
-    WITH top_reviewers AS (
-        SELECT reviewer_login FROM pr_reviews
-        GROUP BY reviewer_login ORDER BY COUNT(*) DESC LIMIT 8
-    ),
-    monthly AS (
-        SELECT r.reviewer_login,
-               DATE_TRUNC('month', r.submitted_at)::DATE mnth,
-               COUNT(*) review_count,
-               CAST(MEDIAN(DATEDIFF('hour', pr.created_at, r.submitted_at)) AS INTEGER) median_hours
-        FROM pr_reviews r
-        JOIN pull_requests pr ON r.pr_number = pr.number
-        WHERE r.reviewer_login IN (SELECT reviewer_login FROM top_reviewers)
-        GROUP BY r.reviewer_login, mnth
-    )
-    SELECT * FROM monthly ORDER BY reviewer_login, mnth
-""").df()
-burnout["median_days"] = (burnout["median_hours"] / 24.0).round(1)
-
-fig33 = go.Figure()
-reviewer_colors = [BLUE, CYAN, GREEN, ORANGE, PURPLE, RED, YELLOW, MUTED]
-for i, (reviewer, group) in enumerate(burnout.groupby("reviewer_login")):
-    group = group.sort_values("mnth")
-    color = reviewer_colors[i % len(reviewer_colors)]
-    # Review volume
-    fig33.add_trace(go.Scatter(
-        x=group["mnth"], y=group["review_count"],
-        mode="lines", name=f"{reviewer} (reviews)",
-        line=dict(color=color, width=2),
-        hovertemplate="<b>%{x|%b %Y}</b><br>%{y:,} reviews<extra></extra>",
-        visible=True,
-    ))
-    # Response time
-    fig33.add_trace(go.Scatter(
-        x=group["mnth"], y=group["median_days"],
-        mode="lines", name=f"{reviewer} (days)",
-        line=dict(color=color, width=1.5, dash="dot"),
-        hovertemplate="<b>%{x|%b %Y}</b><br>Median: %{y:.1f} days<extra></extra>",
-        visible="legendonly",
-    ))
-fig33.update_layout(**base_layout(
-    t=110,
-    title=dict(text="Reviewer Burnout Watch — Top 8 Reviewers' Monthly Activity", font=dict(size=16, color=TEXT), x=0),
-    xaxis=dict(gridcolor=BORDER, title=""),
-    yaxis=dict(gridcolor=BORDER, title="Reviews per Month"),
-    legend=dict(orientation="h", x=0, y=1.1, bgcolor="rgba(0,0,0,0)", font=dict(size=9)),
-    hovermode="x unified",
-    height=550,
-))
-
-
 # ── Export social media PNGs (1200×h, retina 2×) ─────────────────────────────
 
 if not args.no_images:
@@ -1692,21 +982,6 @@ if not args.no_images:
         ("16_bug_association_scatter",  fig16, 700),
         ("17_file_bug_proneness",       fig17, 700),
         ("18_bug_hotspot_treemap",      fig18, 700),
-        ("19_merge_speed_trend",        fig19, 630),
-        ("20_time_to_first_review",     fig20, 630),
-        ("21_review_iterations",        fig21, 630),
-        ("22_day_of_week",              fig22, 630),
-        ("23_reviewer_response_time",   fig23, 630),
-        ("24_first_timer_merge_rate",   fig24, 630),
-        ("25_contributor_retention",    fig25, 630),
-        ("26_stale_pr_predictors",      fig26, 630),
-        ("27_file_coupling",            fig27, 700),
-        ("28_review_depth_vs_speed",    fig28, 630),
-        ("29_description_vs_outcome",   fig29, 630),
-        ("30_title_keyword_lift",       fig30, 700),
-        ("31_reviewer_author_network",  fig31, 800),
-        ("32_event_driven_volume",      fig32, 630),
-        ("33_reviewer_burnout",         fig33, 630),
     ]
     for slug, fig, h in charts:
         path = os.path.join(args.output_dir, f"{slug}.png")
@@ -1716,7 +991,7 @@ if not args.no_images:
 # ── Assemble HTML ──────────────────────────────────────────────────────────────
 
 if not args.no_html:
-    def to_div(fig: Any) -> str:
+    def to_div(fig):
         return fig.to_html(full_html=False, include_plotlyjs=False,
                            config={"displayModeBar": False, "responsive": True})
 
@@ -1726,7 +1001,7 @@ if not args.no_html:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Godot Engine · PR Analytics</title>
-  <script src="https://cdn.plot.ly/plotly-3.5.0.min.js" charset="utf-8"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -2112,174 +1387,6 @@ if not args.no_html:
       concentrate the most bug debt and which files within them punch above their weight.
     </p>
     <div class="chart-card">{to_div(fig18)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">19</span>
-      <span class="section-title">Merge Speed Over Time</span></div>
-    <p class="section-desc">
-      Is the project's review process scaling with growth? This chart tracks median and mean
-      merge time per year alongside PR volume. A widening gap between median and mean signals
-      a growing long tail — more PRs getting stuck for months while the fast lane stays fast.
-    </p>
-    <div class="chart-card">{to_div(fig19)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">20</span>
-      <span class="section-title">Time to First Review</span></div>
-    <p class="section-desc">
-      The real bottleneck isn't merging — it's getting someone to look. This measures
-      how long PRs sit unreviewed. A rising trend means the project needs more reviewers
-      or better PR triage.
-    </p>
-    <div class="chart-card">{to_div(fig20)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">21</span>
-      <span class="section-title">Review Iterations</span></div>
-    <p class="section-desc">
-      More review rounds mean more friction before landing. If iterations are rising,
-      it could signal stricter standards — or growing difficulty getting consensus.
-      Compare with merged PR volume to normalize for activity level.
-    </p>
-    <div class="chart-card">{to_div(fig21)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">22</span>
-      <span class="section-title">The Weekly Rhythm</span></div>
-    <p class="section-desc">
-      PR submission and merge rates by day of week. Blue bars are weekdays,
-      purple are weekends. Does the project review on weekends or let PRs pile up?
-      The merge rate panel reveals whether submitted timing matters for success.
-    </p>
-    <div class="chart-card">{to_div(fig22)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">23</span>
-      <span class="section-title">Gatekeeper Speed Rankings</span></div>
-    <p class="section-desc">
-      Every PR needs a reviewer to look at it. This ranks the top reviewers by
-      median time-to-respond (from PR creation to their review). Faster reviewers
-      are greener, slower are redder. Only reviewers with ≥50 reviews shown for
-      statistical reliability.
-    </p>
-    <div class="chart-card">{to_div(fig23)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">24</span>
-      <span class="section-title">First-Timer Merge Rate</span></div>
-    <p class="section-desc">
-      Critical community health metric: is it getting harder for new contributors
-      to land their first PR? A declining merge rate signals growing barriers to entry.
-      The bars show total first-timer PR volume; the line tracks their merge rate.
-    </p>
-    <div class="chart-card">{to_div(fig24)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">25</span>
-      <span class="section-title">Contributor Stickiness</span></div>
-    <p class="section-desc">
-      Do first-time contributors come back? This measures the percentage of newcomers
-      who submit another PR within 12 months. A declining retention rate suggests
-      the project is struggling to convert new contributors into regulars.
-    </p>
-    <div class="chart-card">{to_div(fig25)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">26</span>
-      <span class="section-title">Stale PR Predictors</span></div>
-    <p class="section-desc">
-      What correlates with a PR still being open after 1+ years? PR size is a strong
-      predictor — huge PRs are dramatically more likely to go stale. This is actionable:
-      encourage contributors to split large changes into smaller, reviewable pieces.
-    </p>
-    <div class="chart-card">{to_div(fig26)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">27</span>
-      <span class="section-title">File Coupling</span></div>
-    <p class="section-desc">
-      Which files are almost always changed together? These co-change pairs reveal
-      hidden coupling in the codebase. Files that are consistently modified in the
-      same PR may indicate a missing abstraction or a refactoring opportunity.
-    </p>
-    <div class="chart-card">{to_div(fig27)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">28</span>
-      <span class="section-title">Review Depth vs Merge Speed</span></div>
-    <p class="section-desc">
-      Does thorough review slow things down — or speed them up? PRs with more review
-      rounds naturally take longer (panel 2), but the relationship reveals whether
-      review is primarily a delay or a necessary filter.
-    </p>
-    <div class="chart-card">{to_div(fig28)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">29</span>
-      <span class="section-title">Description Length vs Outcome</span></div>
-    <p class="section-desc">
-      Does writing a longer description help your PR get merged? Limited to the
-      last 2 years where data is complete. Bar height shows how common each
-      description length is; the green share shows how often those PRs get merged.
-      The tiny "No description" bar makes the small sample obvious — don't read
-      too much into its merge rate.
-    </p>
-    <div class="chart-card">{to_div(fig29)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">30</span>
-      <span class="section-title">Title Keyword Lift</span></div>
-    <p class="section-desc">
-      The first word of your PR title carries signal. This chart shows which opening
-      words are disproportionately associated with merged (green) vs unmerged (red) PRs.
-      A lift above 1.0 means that word appears more often in merged PRs than average.
-    </p>
-    <div class="chart-card">{to_div(fig30)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">31</span>
-      <span class="section-title">Reviewer-Author Network</span></div>
-    <p class="section-desc">
-      Who reviews whom? These are the strongest reviewer → author pairs (≥8 reviews).
-      Strong one-directional pairs may indicate specialization or mentorship. A lack
-      of cross-review between certain areas could signal knowledge silos.
-    </p>
-    <div class="chart-card">{to_div(fig31)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">32</span>
-      <span class="section-title">Events That Shaped the Community</span></div>
-    <p class="section-desc">
-      Monthly PR volume overlaid with key events in Godot's history. The Unity pricing
-      controversy of September 2023 drove an unprecedented surge in community contributions.
-      Godot 4.0's release (March 2023) and earlier milestones are annotated.
-    </p>
-    <div class="chart-card">{to_div(fig32)}</div>
-  </section>
-
-  <section class="section">
-    <div class="section-header"><span class="section-num">33</span>
-      <span class="section-title">Reviewer Burnout Watch</span></div>
-    <p class="section-desc">
-      Tracking the top 8 reviewers' monthly activity. Solid lines show review volume;
-      dotted lines (click legend to show) track median response time. A sustained decline
-      in volume combined with rising response time is an early warning sign of burnout.
-    </p>
-    <div class="chart-card">{to_div(fig33)}</div>
   </section>
 
 </div>

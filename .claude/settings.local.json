@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_MotherDuck__query",
+      "Bash(uv run *)"
+    ]
+  }
+}

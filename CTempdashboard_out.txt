@@ -1,0 +1,8 @@
+Attempting to automatically open the SSO authorization page in your default browser.
+Please open this link to login into your account: https://auth.motherduck.com/activate?user_code=CPRV-MPKR
+
+
+Token successfully retrieved
+
+You can display the token and store it as an environment variable to avoid having to log in again:
+  PRAGMA PRINT_MD_TOKEN;
